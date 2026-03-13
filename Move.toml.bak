@@ -1,0 +1,6 @@
+[package]
+name = "turret_extension"
+edition = "2024.beta"
+
+[dependencies]
+world = { local = "/home/aaron/world-contracts/contracts/world" }

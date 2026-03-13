@@ -1,0 +1,293 @@
+#[allow(unused_use, unused_const, unused_field)]
+/// Custom turret targeting extension for EVE Frontier.
+///
+/// Three operating modes:
+///   MODE_WHITELIST (1) — shoots everyone except the allowed tribe (default)
+///   MODE_AGGRESSOR (2) — only shoots confirmed aggressors
+///   MODE_SENTRY    (3) — passive, only shoots aggressors (same as aggressor mode but intent differs)
+///
+/// Features:
+///   - Ship-type specialization bonus
+///   - Focus-fire on aggressors first
+///   - Rich on-chain events for Discord webhook notifications
+///   - Admin functions to change mode and allowed tribe
+module turret_extension::turret_extension;
+
+use sui::{bcs, event};
+use turret_extension::config::{Self, AdminCap, ExtensionConfig};
+use world::{
+    character,
+    character::Character,
+    turret::{Self, OnlineReceipt, ReturnTargetPriorityList, Turret},
+    access::OwnerCap,
+};
+
+// === Ship Group IDs ===
+const GROUP_SHUTTLE: u64              = 31;
+const GROUP_CORVETTE: u64             = 237;
+const GROUP_FRIGATE: u64              = 25;
+const GROUP_DESTROYER: u64            = 420;
+const GROUP_CRUISER: u64              = 26;
+const GROUP_COMBAT_BATTLECRUISER: u64 = 419;
+
+// === Turret Weapon Type IDs ===
+const WEAPON_AUTOCANNON: u64 = 92402;
+const WEAPON_PLASMA: u64     = 92403;
+const WEAPON_HOWITZER: u64   = 92484;
+
+// === Weight Constants ===
+const SPECIALIZATION_BONUS: u64 = 5000;
+const AGGRESSOR_BONUS: u64      = 10000;
+const BASE_WEIGHT: u64          = 1000;
+
+// === Errors ===
+#[error(code = 0)]
+const EInvalidOnlineReceipt: vector<u8> = b"Invalid online receipt for this turret";
+
+// === Events ===
+
+/// Emitted every targeting cycle — useful for engagement log dashboard.
+public struct PriorityListUpdatedEvent has copy, drop {
+    turret_id: ID,
+    mode: u8,
+    target_count: u64,
+}
+
+/// Emitted for each target added to the shoot list.
+public struct TargetEngagedEvent has copy, drop {
+    turret_id: ID,
+    target_item_id: u64,
+    target_type_id: u64,
+    target_group_id: u64,
+    character_id: u32,
+    character_tribe: u32,
+    is_aggressor: bool,
+    final_weight: u64,
+}
+
+/// Emitted when an aggressor is detected — triggers Discord alert.
+public struct AggressionDetectedEvent has copy, drop {
+    turret_id: ID,
+    attacker_item_id: u64,
+    attacker_type_id: u64,
+    attacker_group_id: u64,
+    attacker_tribe: u32,
+}
+
+/// Emitted when the turret mode is changed.
+public struct ModeChangedEvent has copy, drop {
+    turret_id: ID,
+    old_mode: u8,
+    new_mode: u8,
+}
+
+/// Emitted when the allowed tribe is updated.
+public struct AllowedTribeUpdatedEvent has copy, drop {
+    turret_id: ID,
+    new_tribe: u32,
+}
+
+// === Core Targeting Function ===
+
+/// Called by the game whenever target behaviour changes.
+/// Returns BCS of vector<ReturnTargetPriorityList>.
+public fun get_target_priority_list(
+    turret: &Turret,
+    owner_character: &Character,
+    config: &ExtensionConfig,
+    target_candidate_list: vector<u8>,
+    receipt: OnlineReceipt,
+): vector<u8> {
+    assert!(receipt.turret_id() == object::id(turret), EInvalidOnlineReceipt);
+
+    let mode = config::get_mode(config);
+    let allowed_tribe = config::get_allowed_tribe(config);
+    let turret_type_id = turret.type_id();
+    let owner_tribe = character::tribe(owner_character);
+    let owner_item_id = character::key(owner_character).item_id();
+
+    let candidates = turret::unpack_candidate_list(target_candidate_list);
+    let mut return_list = vector::empty<ReturnTargetPriorityList>();
+    let mut i = 0u64;
+    let len = vector::length(&candidates);
+
+    while (i < len) {
+        let candidate = vector::borrow(&candidates, i);
+        let cand_tribe = turret::character_tribe(candidate);
+        let is_aggressor = turret::is_aggressor(candidate);
+        let cand_char_id = turret::character_id(candidate);
+
+        // Always skip the owner
+        if (cand_char_id != 0 && (cand_char_id as u64) == owner_item_id) {
+            i = i + 1;
+            continue
+        };
+
+        // Always protect allowed tribe unless they attack
+        if (cand_tribe == allowed_tribe && !is_aggressor) {
+            i = i + 1;
+            continue
+        };
+
+        // Always protect same tribe as owner unless they attack
+        if (cand_tribe == owner_tribe && !is_aggressor) {
+            i = i + 1;
+            continue
+        };
+
+        // Apply mode rules
+        let should_target = apply_mode_rules(mode, is_aggressor);
+
+        if (should_target) {
+            let weight = calculate_weight(candidate, turret_type_id, is_aggressor);
+
+            // Emit aggression alert for Discord notifications
+            if (is_aggressor) {
+                event::emit(AggressionDetectedEvent {
+                    turret_id: object::id(turret),
+                    attacker_item_id: turret::item_id(candidate),
+                    attacker_type_id: turret::target_type_id(candidate),
+                    attacker_group_id: turret::group_id(candidate),
+                    attacker_tribe: cand_tribe,
+                });
+            };
+
+            event::emit(TargetEngagedEvent {
+                turret_id: object::id(turret),
+                target_item_id: turret::item_id(candidate),
+                target_type_id: turret::target_type_id(candidate),
+                target_group_id: turret::group_id(candidate),
+                character_id: cand_char_id,
+                character_tribe: cand_tribe,
+                is_aggressor,
+                final_weight: weight,
+            });
+
+            vector::push_back(
+                &mut return_list,
+                turret::new_return_target_priority_list(
+                    turret::item_id(candidate),
+                    weight,
+                ),
+            );
+        };
+
+        i = i + 1;
+    };
+
+    event::emit(PriorityListUpdatedEvent {
+        turret_id: object::id(turret),
+        mode,
+        target_count: vector::length(&return_list),
+    });
+
+    turret::destroy_online_receipt(receipt, config::turret_auth());
+    bcs::to_bytes(&return_list)
+}
+
+// === Admin Functions ===
+
+/// Change the operating mode. Emits ModeChangedEvent.
+public fun set_mode(
+    turret: &Turret,
+    config: &mut ExtensionConfig,
+    admin_cap: &AdminCap,
+    new_mode: u8,
+) {
+    let old_mode = config::get_mode(config);
+    config::set_mode(config, admin_cap, new_mode);
+    event::emit(ModeChangedEvent {
+        turret_id: object::id(turret),
+        old_mode,
+        new_mode,
+    });
+}
+
+/// Change the allowed tribe. Emits AllowedTribeUpdatedEvent.
+public fun set_allowed_tribe(
+    turret: &Turret,
+    config: &mut ExtensionConfig,
+    admin_cap: &AdminCap,
+    tribe: u32,
+) {
+    config::set_allowed_tribe(config, admin_cap, tribe);
+    event::emit(AllowedTribeUpdatedEvent {
+        turret_id: object::id(turret),
+        new_tribe: tribe,
+    });
+}
+
+/// Authorize this extension on the turret. Call once after deploying.
+public fun authorize(
+    turret: &mut Turret,
+    owner_cap: &OwnerCap<Turret>,
+) {
+    turret::authorize_extension<config::TurretAuth>(turret, owner_cap);
+}
+
+/// Freeze the extension config so players can trust it won't change.
+public fun freeze_config(
+    turret: &mut Turret,
+    owner_cap: &OwnerCap<Turret>,
+) {
+    turret::freeze_extension_config(turret, owner_cap);
+}
+
+// === Private Logic ===
+
+/// Determines whether a target should be shot based on current mode.
+/// MODE_WHITELIST: shoot everyone not protected
+/// MODE_AGGRESSOR: only confirmed aggressors
+/// MODE_SENTRY: only confirmed aggressors (passive until attacked)
+fun apply_mode_rules(mode: u8, is_aggressor: bool): bool {
+    if (mode == config::mode_whitelist()) {
+        true
+    } else if (mode == config::mode_aggressor()) {
+        is_aggressor
+    } else if (mode == config::mode_sentry()) {
+        is_aggressor
+    } else {
+        true
+    }
+}
+
+/// Calculates final priority weight for a target.
+/// Higher weight = shot first.
+fun calculate_weight(
+    candidate: &turret::TargetCandidate,
+    turret_type_id: u64,
+    is_aggressor: bool,
+): u64 {
+    let mut weight = turret::priority_weight(candidate);
+
+    // Start with base weight if current weight is 0
+    if (weight == 0) {
+        weight = BASE_WEIGHT;
+    };
+
+    // Aggressors get highest priority
+    if (is_aggressor) {
+        weight = weight + AGGRESSOR_BONUS;
+    };
+
+    // Weapon specialization bonus
+    let group = turret::group_id(candidate);
+    if (is_specialized_target(turret_type_id, group)) {
+        weight = weight + SPECIALIZATION_BONUS;
+    };
+
+    weight
+}
+
+/// Returns true if this turret weapon type is specialized against the target group.
+fun is_specialized_target(turret_type_id: u64, group_id: u64): bool {
+    if (turret_type_id == WEAPON_AUTOCANNON) {
+        group_id == GROUP_SHUTTLE || group_id == GROUP_CORVETTE
+    } else if (turret_type_id == WEAPON_PLASMA) {
+        group_id == GROUP_FRIGATE || group_id == GROUP_DESTROYER
+    } else if (turret_type_id == WEAPON_HOWITZER) {
+        group_id == GROUP_CRUISER || group_id == GROUP_COMBAT_BATTLECRUISER
+    } else {
+        false
+    }
+}
